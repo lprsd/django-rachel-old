@@ -1,8 +1,11 @@
 from django.db import models
 from django.db.models import permalink
 from django.contrib.auth.models import User
+from django.conf import settings
+from django.contrib.comments.moderation import CommentModerator, moderator
 
 from taggit.managers import TaggableManager
+from markupfield.fields import MarkupField
 
 class Blog(models.Model):
     """Blog wide settings.
@@ -29,6 +32,11 @@ class Blog(models.Model):
         super(Blog, self).save() # Call the "real" save() method.
 
         
+class BlogPublishedManager(models.Manager):
+    use_for_related_fields = True
+    
+    def get_query_set(self):
+        return super(BlogPublishedManager, self).get_query_set().filter(is_published=True)
 
 class BlogEntry(models.Model):
     """Each blog entry.
@@ -45,7 +53,10 @@ class BlogEntry(models.Model):
     
     title = models.CharField(max_length=100)
     slug = models.SlugField()
-    text = models.TextField()
+    text = MarkupField(default_markup_type=getattr(settings,
+                                                      'DEFAULT_MARKUP_TYPE',
+                                                      'markdown'),
+                          markup_choices=settings.MARKUP_RENDERERS)
     summary = models.TextField()
     created_on = models.DateTimeField(auto_now_add=True)
     created_by = models.ForeignKey(User, unique=False)
@@ -59,6 +70,9 @@ class BlogEntry(models.Model):
 
     tags = TaggableManager()
     
+    default = models.Manager()
+    objects = BlogPublishedManager()
+    
     class Meta:
         ordering = ['-created_on']
         verbose_name_plural = 'Blog entries'
@@ -66,13 +80,13 @@ class BlogEntry(models.Model):
     def __unicode__(self):
         return self.title
 
-    def save(self):
+    def save(self, *args, **kwargs):
         if self.title == None  or self.title == '':
-            self.title = _infer_title_or_slug(self.text)
+            self.title = _infer_title_or_slug(self.text.raw)
         if self.slug == None or self.slug == '':
-            self.slug = _infer_title_or_slug(self.text)
+            self.slug = _infer_title_or_slug(self.title)
         if not self.summary: 
-            self.summary = _generate_summary(self.text)
+            self.summary = _generate_summary(self.text.raw)
         if not self.meta_keywords:
             self.meta_keywords = self.summary
         if not self.meta_description:
@@ -88,13 +102,34 @@ class BlogEntry(models.Model):
     
     @permalink 
     def get_edit_url(self):
-        return ('blogango.views.edit_entry', [self.id])
+        return ('blogango.views.admin_entry_edit', [self.id])
      
     def get_num_comments(self):
-        cmnt_count = Comment.objects.filter(comment_for=self).count()
+        cmnt_count = Comment.objects.filter(comment_for=self, is_spam=False).count()
         return cmnt_count
 
-class Comment(models.Model):
+    def get_num_reactions(self):
+        reaction_count = Reaction.objects.filter(comment_for=self).count()
+        return reaction_count
+
+class CommentManager(models.Manager):
+    def get_query_set(self):
+        return super(CommentManager, self).get_query_set().filter(is_public=True)
+
+class BaseComment(models.Model):
+    text = models.TextField()
+    comment_for = models.ForeignKey(BlogEntry)
+    created_on = models.DateTimeField(auto_now_add=True)
+    user_name = models.CharField(max_length=100)
+    
+    class Meta:
+        ordering = ['created_on']
+        abstract = True
+
+    def __unicode__(self):
+        return self.text
+
+class Comment(BaseComment):
     """Comments for each blog.
     text: The comment text.
     comment_for: the Post/Page this comment is created for.
@@ -102,29 +137,32 @@ class Comment(models.Model):
     created_by: THe user who wrote this comment.
     user_name = If created_by is null, this comment was by anonymous user. Name in that case.
     email_id: Email-id, as in user_name.
-    is_spam: Is comment marked as spam? We do not display the comment in those cases."""
-    
-    text = models.TextField()
-    comment_for = models.ForeignKey(BlogEntry)
-    created_on = models.DateTimeField(auto_now_add=True)
+    is_spam: Is comment marked as spam? We do not display the comment in those cases.
+    is_public: null for comments waiting to be approved, True if approved, False if rejected
+    """
+
     created_by = models.ForeignKey(User, unique=False, blank=True, null=True)
-    user_name = models.CharField(max_length=100)
     user_url = models.CharField(max_length=100)
     email_id = models.EmailField()
     is_spam = models.BooleanField(default=False)
+    is_public = models.NullBooleanField(null=True, blank=True)
 
-    class Meta:
-        ordering = ['created_on']
+    default = models.Manager()
+    objects = CommentManager()
 
-    def __unicode__(self):
-        return self.text
-    
     @permalink
     def get_absolute_url (self):
         #return '/comment/%s/' %self.id
           return ('comment_details', self.id)
-     
       
+class Reaction(BaseComment):
+    """
+    Reactions from various social media sites
+    """
+    reaction_id = models.CharField(max_length=200, primary_key=True)
+    source = models.CharField(max_length=200)
+    profile_image = models.URLField(blank=True, null=True)
+
 class BlogRoll(models.Model):
     url = models.URLField(unique=True)
     text = models.CharField(max_length=100)
@@ -136,6 +174,9 @@ class BlogRoll(models.Model):
     def get_absolute_url(self):
         return self.url
 
+class CommentModerator(CommentModerator):
+    email_notification = True
+    enable_field = 'is_public'
         
 #Helper methods
 def _infer_title_or_slug(text):
@@ -144,3 +185,4 @@ def _infer_title_or_slug(text):
 def _generate_summary(text):
      return ' '.join(text.split()[:100])
 
+moderator.register(Comment, CommentModerator)
